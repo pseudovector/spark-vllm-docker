@@ -1,0 +1,19 @@
+[Unit]
+Description=vLLM Qwen3-Next-80B-A3B-Instruct-FP8 Service
+After=docker.service
+Requires=docker.service
+Conflicts=vllm-glm-4-flash.service vllm-qwen3-coder-next.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=jack
+
+ExecStart=/home/jack/deploy/vllm/spark-vllm-docker/vllm-start-qwen3-next.sh
+ExecStop=/usr/bin/docker stop --time=60 vllm_node
+ExecStopPost=/usr/bin/docker rm -f vllm_node
+
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
