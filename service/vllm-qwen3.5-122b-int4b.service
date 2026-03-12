@@ -1,0 +1,19 @@
+[Unit]
+Description=vLLM Qwen3.5-122B-Int4-AutoRound Service
+After=docker.service
+Requires=docker.service
+Conflicts=vllm-qwen3-coder-next.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=jack
+
+ExecStart=/home/jack/deploy/vllm/spark-vllm-docker/vllm-start-qwen3.5-122b-int4.sh
+ExecStop=/usr/bin/docker stop --time=60 vllm-node-tf5
+ExecStopPost=/usr/bin/docker rm -f vllm-node-tf5
+
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
