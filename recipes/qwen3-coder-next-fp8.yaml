@@ -1,0 +1,43 @@
+# Recipe: Qwen3-Coder-Next-FP8
+# Qwen3-Coder-Next model in native FP8 format
+# Currently can only be run in solo mode, cluster mode fails with error - tracking https://github.com/vllm-project/vllm/issues/33857
+
+recipe_version: "1"
+name: Qwen3-Coder-Next-FP8
+description: vLLM serving Qwen3-Coder-Next-FP8 on a SINGLE NODE ONLY!
+
+# HuggingFace model to download (optional, for --download-model)
+model: Qwen/Qwen3-Coder-Next-FP8
+
+# This model can only run on single node (solo)
+solo_only: true
+
+# Container image to use
+container: vllm-node
+
+# No mods required
+mods: []
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 262144
+
+# Environment variables
+env: {}
+
+# The vLLM serve command template
+command: |
+  vllm serve Qwen/Qwen3-Coder-Next-FP8 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --host {host} \
+    --port {port} \
+    --load-format fastsafetensors \
+    --attention-backend flashinfer \
+    --enable-prefix-caching \
+    --max-model-len {max_model_len} 
