@@ -8,7 +8,7 @@ LOG_FILE="$LOG_DIR/vllm-qwen3.5-122b-int4.log"
 mkdir -p "$LOG_DIR"
 cd "$SCRIPT_DIR"
 
-nohup ./run-recipe.sh qwen3.5-122b-int4-autoround --solo --gpu-mem 0.8 >> "$LOG_FILE" 2>&1 &
+nohup ./run-recipe.sh qwen3.5-122b-int4-autoround --solo --gpu-mem 0.85 --container vllm-node-tf5 >> "$LOG_FILE" 2>&1 &
 sleep 2
 
 if docker ps | grep -q vllm-node-tf5; then
