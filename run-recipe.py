@@ -68,6 +68,7 @@ RECIPE YAML SCHEMA:
     env: dict              # Optional: Environment variables
     build_args: list[str]  # Optional: Args for build-and-copy.sh
     cluster_only: bool     # Optional: Require cluster mode (default: false)
+    solo_only: bool        # Optional: Require solo mode (default: false)
 
 RECIPE VERSION HISTORY:
     Version 1 (default): Initial schema with all fields above supported.
@@ -85,6 +86,7 @@ RELATED FILES:
 import argparse
 import os
 import subprocess
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -132,6 +134,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         env (dict, optional): Environment variables to export before running
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
         cluster_only (bool, optional): If True, recipe cannot run in solo mode
+        solo_only (bool, optional): If True, recipe cannot run in cluster mode
     
     Args:
         recipe_path: Path object pointing to YAML file or just recipe name
@@ -175,6 +178,8 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("mods", [])
     recipe.setdefault("defaults", {})
     recipe.setdefault("env", {})
+    recipe.setdefault("cluster_only", False)
+    recipe.setdefault("solo_only", False)
     
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -221,6 +226,7 @@ def list_recipes() -> None:
             model = recipe.get("model", "")
             mods = recipe.get("mods", [])
             cluster_only = recipe.get("cluster_only", False)
+            solo_only = recipe.get("solo_only", False)
             
             print(f"  {recipe_path.name}")
             print(f"    Name: {name}")
@@ -229,7 +235,9 @@ def list_recipes() -> None:
             if model:
                 print(f"    Model: {model}")
             if cluster_only:
-                print(f"    Cluster only: Yes")
+                print("    Cluster only: Yes")
+            if solo_only:
+                print("    Solo only: Yes")
             print(f"    Container: {container}")
             if build_args:
                 print(f"    Build args: {' '.join(build_args)}")
@@ -466,7 +474,7 @@ def generate_launch_script(recipe: dict[str, Any], overrides: dict[str, Any], is
     # Append extra args if provided (after --)
     if extra_args:
         # Join extra args and append to command
-        extra_args_str = ' '.join(extra_args)
+        extra_args_str = ' '.join(shlex.quote(a) for a in extra_args)
         command = command.rstrip()
         # Handle multi-line commands with backslash continuations
         if command.endswith('\\'):
@@ -811,6 +819,7 @@ Examples:
     launch_group.add_argument("-d", "--daemon", action="store_true", help="Run in daemon mode")
     launch_group.add_argument("-t", "--container", dest="container_override", help="Override container image from recipe")
     launch_group.add_argument("--nccl-debug", choices=["VERSION", "WARN", "INFO", "TRACE"], help="NCCL debug level")
+    launch_group.add_argument("-e", "--env", action="append", dest="env_vars", default=[], metavar="VAR=VALUE", help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.")
     
     # Cluster discovery options
     discover_group = parser.add_argument_group("Cluster discovery")
@@ -921,6 +930,7 @@ Examples:
     
     # Check if recipe requires cluster mode
     cluster_only = recipe.get("cluster_only", False)
+    solo_only = recipe.get("solo_only", False)
     is_solo = args.solo or not is_cluster
     
     if cluster_only and is_solo:
@@ -931,6 +941,14 @@ Examples:
         print(f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2")
         print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        return 1
+    if solo_only and not is_solo:
+        print(f"Error: Recipe '{recipe['name']}' requires solo mode.")
+        print("This recipe is intended to run on a single node only.")
+        print()
+        print("Options:")
+        print(f"  1. Run solo:                {sys.argv[0]} {args.recipe} --solo")
+        print(f"  2. Remove nodes from .env:  {sys.argv[0]} --show-env")
         return 1
     
     # Determine copy targets for cluster deployments
@@ -944,7 +962,9 @@ Examples:
         if model:
             print(f"Model: {model}")
         if cluster_only:
-            print(f"Cluster only: Yes (model too large for single node)")
+            print("Cluster only: Yes (model too large for single node)")
+        if solo_only:
+            print("Solo only: Yes (single node only)")
         if nodes:
             source = "(from .env)" if nodes_from_env else ""
             print(f"Nodes: {', '.join(nodes)} {source}".strip())
@@ -1100,6 +1120,8 @@ Examples:
             cmd_parts.extend(["-n", ",".join(nodes)])
         if args.nccl_debug:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
+        for env_var in args.env_vars:
+            cmd_parts.extend(["-e", env_var])
         cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
         print(" ".join(cmd_parts))
         print()
@@ -1140,6 +1162,9 @@ Examples:
         
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])
+        
+        for env_var in args.env_vars:
+            cmd.extend(["-e", env_var])
         
         # Add launch script
         cmd.extend(["--launch-script", temp_script])

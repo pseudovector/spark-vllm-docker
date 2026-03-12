@@ -67,7 +67,8 @@ ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
 WORKDIR $VLLM_BASE_DIR
 
 # 2. Set Environment Variables
-ENV TORCH_CUDA_ARCH_LIST="12.0;12.1"
+ARG TORCH_CUDA_ARCH_LIST="12.1a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 
 # --- CACHE BUSTER ---
@@ -88,7 +89,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # =========================================================
 FROM base AS builder
 
-ENV FLASHINFER_CUDA_ARCH_LIST="12.1f"
+ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 
 WORKDIR $VLLM_BASE_DIR
 
@@ -96,7 +98,7 @@ ARG FLASHINFER_REPO=https://github.com/christopherowen/flashinfer.git
 ARG CUTLASS_REPO=https://github.com/christopherowen/cutlass.git
 
 ARG FLASHINFER_SHA=f349e52496a72a00d8c4ac02c7a1e38523ff7194
-ARG CUTLASS_SHA=11af7f02ab52c9130e422eeb4b44042fbd60c083
+ARG CUTLASS_SHA=c7516ad20f3d022fdbc93e9468643bf3b577e02c
 
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
      uv pip install nvidia-nvshmem-cu13 "apache-tvm-ffi<0.2"
@@ -107,13 +109,13 @@ RUN --mount=type=cache,id=git-flashinfer,target=/git-cache/flashinfer \
         echo "=== Using cached FlashInfer repo ===" && \
         cp -a /git-cache/flashinfer /workspace/flashinfer && \
         cd /workspace/flashinfer && \
-        git fetch origin; \
+        git fetch origin && git fetch origin --tags; \
     else \
         echo "=== Cloning FlashInfer (first build) ===" && \
         git clone ${FLASHINFER_REPO} /workspace/flashinfer && \
         cp -a /workspace/flashinfer /git-cache/flashinfer; \
     fi && \
-    cd /workspace/flashinfer && git checkout ${FLASHINFER_SHA}
+    cd /workspace/flashinfer &&  (git checkout --detach origin/${FLASHINFER_SHA} 2>/dev/null || git checkout ${FLASHINFER_SHA})
 
 # Clone spdlog submodule (small, no caching needed)
 RUN cd /workspace/flashinfer && \
@@ -127,14 +129,14 @@ RUN --mount=type=cache,id=git-cutlass,target=/git-cache/cutlass \
         echo "=== Using cached CUTLASS repo ===" && \
         cp -a /git-cache/cutlass 3rdparty/cutlass && \
         cd 3rdparty/cutlass && \
-        git fetch origin; \
+        git fetch origin && git fetch origin --tags; \
     else \
         echo "=== Cloning CUTLASS (first build) ===" && \
         rm -rf /git-cache/cutlass/* /git-cache/cutlass/.* 2>/dev/null || true && \
         git clone ${CUTLASS_REPO} 3rdparty/cutlass && \
         cp -a /workspace/flashinfer/3rdparty/cutlass/. /git-cache/cutlass/; \
     fi && \
-    cd /workspace/flashinfer/3rdparty/cutlass && git checkout ${CUTLASS_SHA}
+    cd /workspace/flashinfer/3rdparty/cutlass && (git checkout --detach origin/${CUTLASS_SHA} 2>/dev/null || git checkout ${CUTLASS_SHA})
 
 # Build FlashInfer wheels
 
@@ -165,7 +167,7 @@ ARG CACHEBUST_VLLM=1
 ARG VLLM_REPO=https://github.com/christopherowen/vllm.git
 
 # Git reference (branch, tag, or SHA) to checkout
-ARG VLLM_SHA=459541683f2d8c21f9c0e2f44954b04f59611cbe
+ARG VLLM_SHA=045293d82b832229560ac4a13152a095af603b6e
 
 # 4. Smart Git Clone (Fetch changes instead of full re-clone)
 # We mount a cache at /repo-cache. This directory persists on your host machine.
@@ -181,12 +183,11 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm-mxfp4 && \
-        git fetch --all && \
-        git checkout ${VLLM_SHA} && \
-        if [ "${VLLM_SHA}" = "main" ]; then \
-            git reset --hard origin/main; \
-        fi && \
+        git fetch origin && \
+        git fetch origin --tags && \
+        (git checkout --detach origin/${VLLM_SHA} 2>/dev/null || git checkout ${VLLM_SHA}) && \
         git submodule update --init --recursive && \
+        git clean -fdx && \
         # Optimize git repo size
         git gc --auto; \
     fi && \
@@ -211,9 +212,9 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install -r requirements/build.txt
 
 # Apply Patches
-# TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/foundation-model-stack/fastsafetensors/issues/36
-#COPY fastsafetensors.patch .
-#RUN patch -p1 < fastsafetensors.patch
+# TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
+COPY fastsafetensors_mxfp4.patch .
+RUN patch -p1 < fastsafetensors_mxfp4.patch
 
 # Final Compilation
 # We mount the ccache directory here. Ideally, map this to a host volume for persistence 
@@ -260,9 +261,11 @@ RUN --mount=type=bind,from=builder,source=/workspace/wheels,target=/mount/wheels
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install /mount/wheels/*.whl
 
-# Setup Env for Runtime
-ENV TORCH_CUDA_ARCH_LIST="12.0;12.1"
-ENV FLASHINFER_CUDA_ARCH_LIST="12.1f"
+# Setup environment vars for runtime
+ARG TORCH_CUDA_ARCH_LIST="12.1a"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+ARG FLASHINFER_CUDA_ARCH_LIST="12.1a"
+ENV FLASHINFER_CUDA_ARCH_LIST=${FLASHINFER_CUDA_ARCH_LIST}
 ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
@@ -273,7 +276,7 @@ RUN chmod +x $VLLM_BASE_DIR/run-cluster-node.sh
 
 # Final extra deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
-    uv pip install ray[default] fastsafetensors
+    uv pip install ray[default] fastsafetensors nvidia-nvshmem-cu13
 
 # If not compiling Triton
 # remove triton-kernels as they are not compatible with this vLLM version yet
