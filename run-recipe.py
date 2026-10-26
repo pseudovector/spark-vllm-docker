@@ -11,8 +11,8 @@ pre-configured settings. It handles:
 - Both solo (single node) and cluster deployments
 
 Usage:
-    ./run-recipe.py recipes/glm-4.7-nvfp4.yaml
-    ./run-recipe.py glm-4.7-nvfp4 --port 9000 --solo
+    ./run-recipe.py recipes/deepseek-v4-flash-0731.yaml
+    ./run-recipe.py glm-4.7-flash-awq --port 9000 --solo
     ./run-recipe.py minimax-m2-awq --setup  # Full setup: build + download + run
     ./run-recipe.py --list
 
@@ -85,12 +85,15 @@ RELATED FILES:
 
 import argparse
 import os
+import re
 import subprocess
 import shlex
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+from cluster_topology import Topology, validate_launch
 
 try:
     import yaml
@@ -105,7 +108,65 @@ LAUNCH_SCRIPT = SCRIPT_DIR / "launch-cluster.sh"
 BUILD_SCRIPT = SCRIPT_DIR / "build-and-copy.sh"
 DOWNLOAD_SCRIPT = SCRIPT_DIR / "hf-download.sh"
 AUTODISCOVER_SCRIPT = SCRIPT_DIR / "autodiscover.sh"
-ENV_FILE = SCRIPT_DIR / ".env"
+ENV_FILE = None  # Will be set from CLI argument or default
+DISTRIBUTED_EXECUTOR_RE = re.compile(
+    r"--distributed-executor-backend(?:=|\s+)\S+"
+)
+
+
+def runtime_vllm_pr_reference(value: str) -> str:
+    """Validate a PR number or canonical public GitHub pull-request URL."""
+    if re.fullmatch(r"[1-9][0-9]*", value):
+        return value
+    if re.fullmatch(
+        r"https://github\.com/"
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*/"
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*/"
+        r"pull/[1-9][0-9]*/?",
+        value,
+    ):
+        return value.rstrip("/")
+    raise argparse.ArgumentTypeError(
+        "must be a positive integer PR number or full "
+        "https://github.com/OWNER/REPO/pull/NUMBER URL"
+    )
+
+
+class OrderedLaunchLayerAction(argparse.Action):
+    """Collect a repeatable launch layer while preserving mixed CLI ordering."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        collected = list(getattr(namespace, self.dest, None) or [])
+        collected.append(values)
+        setattr(namespace, self.dest, collected)
+
+        ordered = list(getattr(namespace, "launch_layers", None) or [])
+        ordered.append((self.dest, values))
+        setattr(namespace, "launch_layers", ordered)
+
+
+def strip_distributed_executor_backend(command: str) -> str:
+    """Remove vLLM distributed executor backend flags from a command."""
+    command = DISTRIBUTED_EXECUTOR_RE.sub("", command)
+    lines = command.split("\n")
+    filtered_lines = [line for line in lines if line.strip() not in ("", "\\")]
+    return "\n".join(filtered_lines)
+
+
+def ensure_ray_backend(command: str) -> str:
+    """Append the Ray executor backend for vLLM serve commands that omit it."""
+    if "vllm serve" not in command:
+        return command
+    if DISTRIBUTED_EXECUTOR_RE.search(command):
+        return command
+    return command.rstrip() + " --distributed-executor-backend ray"
+
 
 
 def load_recipe(recipe_path: Path) -> dict[str, Any]:
@@ -131,7 +192,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         model (str, optional): HuggingFace model ID for --setup downloads
         mods (list[str], optional): List of mod directories to apply (e.g., 'mods/fix-glm')
         defaults (dict, optional): Default values for command placeholders
-        env (dict, optional): Environment variables to export before running
+        env (dict, optional): Container environment defaults; CLI -e values override them
         build_args (list[str], optional): Extra args for build-and-copy.sh (e.g., ['-f', 'Dockerfile.mxfp4'])
         cluster_only (bool, optional): If True, recipe cannot run in solo mode
         solo_only (bool, optional): If True, recipe cannot run in cluster mode
@@ -146,8 +207,11 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
         SystemExit: If recipe not found or validation fails
     """
     if not recipe_path.exists():
-        # Try recipes directory with various extensions
+        # Try candidates in order: add extension to original path first,
+        # then fall back to flat recipes/ directory (for bare recipe names)
         candidates = [
+            Path(str(recipe_path) + ".yaml"),
+            Path(str(recipe_path) + ".yml"),
             RECIPES_DIR / recipe_path.name,
             RECIPES_DIR / f"{recipe_path.name}.yaml",
             RECIPES_DIR / f"{recipe_path.name}.yml",
@@ -290,7 +354,8 @@ def check_image_exists(image: str, host: str | None = None) -> bool:
 
 
 def build_image(
-    image: str, copy_to: list[str] | None = None, build_args: list[str] | None = None
+    image: str, copy_to: list[str] | None = None, build_args: list[str] | None = None,
+    *, copy_only: bool = False,
 ) -> bool:
     """
     Build the container image using build-and-copy.sh.
@@ -322,10 +387,14 @@ def build_image(
         return False
 
     cmd = [str(BUILD_SCRIPT), "-t", image]
-    if build_args:
+    if ENV_FILE and ENV_FILE.exists():
+        cmd.extend(["--config", str(ENV_FILE)])
+    if copy_only:
+        cmd.append("--no-build")
+    elif build_args:
         cmd.extend(build_args)
     if copy_to:
-        cmd.extend(["--copy-to", ",".join(copy_to)])
+        cmd.extend(["--copy-to", ",".join(copy_to), "--copy-parallel"])
 
     print(f"Building image '{image}'...")
     if build_args:
@@ -362,8 +431,10 @@ def download_model(model: str, copy_to: list[str] | None = None) -> bool:
         return False
 
     cmd = [str(DOWNLOAD_SCRIPT), model]
+    if ENV_FILE and ENV_FILE.exists():
+        cmd.extend(["--config", str(ENV_FILE)])
     if copy_to:
-        cmd.extend(["--copy-to", ",".join(copy_to)])
+        cmd.extend(["--copy-to", ",".join(copy_to), "--copy-parallel"])
 
     print(f"Downloading model '{model}'...")
     if copy_to:
@@ -377,10 +448,9 @@ def check_model_exists(model: str) -> bool:
     """
     Check if a model exists in the HuggingFace cache.
 
-    Checks the standard HF cache location for completed downloads.
+    Uses the same cache environment variables and path expansion as hf-download.sh.
 
     EXTENSIBILITY:
-    - To support custom cache locations: Add HF_HOME env var support
     - To verify model integrity: Check for complete snapshot with config.json
     - To support other model sources: Add URL/path prefix detection
 
@@ -393,7 +463,15 @@ def check_model_exists(model: str) -> bool:
     # Convert model name to cache directory format
     # e.g., "Salyut1/GLM-4.7-NVFP4" -> "models--Salyut1--GLM-4.7-NVFP4"
     cache_name = f"models--{model.replace('/', '--')}"
-    cache_path = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+    cache_home = os.path.expandvars(os.path.expanduser(os.environ.get(
+        "HF_HOME", os.path.join(os.environ.get("XDG_CACHE_HOME", "~/.cache"), "huggingface")
+    )))
+    hub_path = os.path.expandvars(os.path.expanduser(os.environ.get(
+        "HF_HUB_CACHE", os.environ.get("HUGGINGFACE_HUB_CACHE", os.path.join(cache_home, "hub"))
+    )))
+    if not hub_path:
+        return False
+    cache_path = Path(hub_path) / cache_name
 
     if cache_path.exists():
         # Check for snapshots directory which indicates complete download
@@ -408,18 +486,18 @@ def generate_launch_script(
     overrides: dict[str, Any],
     is_solo: bool = False,
     extra_args: list[str] | None = None,
+    use_ray: bool = False,
 ) -> str:
     """
     Generate a bash launch script from the recipe.
 
-    Creates a self-contained bash script that runs inside the container.
-    Handles template substitution, environment variables, and solo mode adjustments.
+    Creates a bash script that runs inside the configured container environment.
+    Handles template substitution and solo mode adjustments.
 
     EXTENSIBILITY:
     - To add new template variables: Add them to recipe['defaults'] or CLI overrides
     - To add pre/post hooks: Add 'pre_command'/'post_command' fields to recipe schema
     - To add conditional logic: Use Jinja2 templating instead of str.format()
-    - To support GPU selection: Add CUDA_VISIBLE_DEVICES to env handling
 
     TEMPLATE VARIABLES (use {variable_name} in recipe command):
         port: API server port (default from recipe)
@@ -429,9 +507,13 @@ def generate_launch_script(
         max_model_len: Maximum sequence length
         (custom variables can be added via recipe defaults)
 
-    SOLO MODE BEHAVIOR:
-        - Removes '--distributed-executor-backend ray' lines
+    SOLO BEHAVIOR:
+        - Strips distributed executor configuration
         - Typically sets tensor_parallel=1 (handled by caller)
+
+    MULTI-NODE BACKEND BEHAVIOR:
+        - No-Ray is the default
+        - --ray preserves or adds Ray distributed executor configuration
 
     EXTRA ARGS:
         - Appended verbatim to the end of the vLLM command
@@ -441,8 +523,9 @@ def generate_launch_script(
     Args:
         recipe: Loaded recipe dictionary
         overrides: CLI-provided parameter overrides (take precedence over defaults)
-        is_solo: If True, strip distributed executor configuration
+        is_solo: If True, generate a single-node launch script
         extra_args: Additional arguments to append to vLLM command (after --)
+        use_ray: If True, preserve/add Ray distributed executor configuration
 
     Returns:
         Complete bash script content as string
@@ -456,14 +539,6 @@ def generate_launch_script(
     # Build the script
     lines = ["#!/bin/bash", f"# Generated from recipe: {recipe['name']}", ""]
 
-    # Add environment variables
-    env_vars = recipe.get("env", {})
-    if env_vars:
-        lines.append("# Environment variables")
-        for key, value in env_vars.items():
-            lines.append(f'export {key}="{value}"')
-        lines.append("")
-
     # Format the command with parameters
     command = recipe["command"]
     try:
@@ -473,29 +548,22 @@ def generate_launch_script(
         print(f"Available parameters: {list(params.keys())}")
         sys.exit(1)
 
-    # In solo mode, remove --distributed-executor-backend ray
-    # (it's not needed and can cause issues on single node)
-    if is_solo:
-        import re
-
-        # Remove the entire line containing --distributed-executor-backend
-        # This handles multi-line commands with backslash continuations
-        lines_list = command.split("\n")
-        filtered_lines = [
-            line for line in lines_list if "--distributed-executor-backend" not in line
-        ]
-        command = "\n".join(filtered_lines)
+    # Remove trailing backslash if present before appending extra args.
+    command = command.rstrip()
+    if command.endswith("\\"):
+        command = command.rstrip("\\\n").rstrip()
 
     # Append extra args if provided (after --)
     if extra_args:
         # Join extra args and append to command
         extra_args_str = " ".join(shlex.quote(a) for a in extra_args)
-        command = command.rstrip()
-        # Handle multi-line commands with backslash continuations
-        if command.endswith("\\"):
-            command = command.rstrip("\\").rstrip() + " \\\n    " + extra_args_str
-        else:
-            command = command + " " + extra_args_str
+        command = command + " " + extra_args_str
+
+    # Normalize distributed backend after CLI passthrough. No-Ray is default.
+    if is_solo or not use_ray:
+        command = strip_distributed_executor_backend(command)
+    else:
+        command = ensure_ray_backend(command)
 
     lines.append("# Run the model")
     lines.append(command.strip())
@@ -547,7 +615,6 @@ def load_env_file() -> dict[str, str]:
     Reads the .env file created by --discover for persistent cluster configuration.
 
     EXTENSIBILITY:
-    - To add new persistent settings: Just add them to save_env_file()
     - To support multiple .env files: Add a --env-file CLI argument
     - To add validation: Check for required keys after loading
 
@@ -573,57 +640,16 @@ def load_env_file() -> dict[str, str]:
     return env
 
 
-def save_env_file(env: dict[str, str]) -> None:
-    """
-    Save environment variables to .env file.
-
-    Persists cluster configuration discovered by autodiscover.sh.
-    Values are properly quoted if they contain spaces or commas.
-
-    EXTENSIBILITY:
-    - To add new persistent settings: Just add them to the env dict before calling
-    - To add timestamps/metadata: Add comment lines to the output
-    - To support append mode: Read existing, merge, then write
-
-    Args:
-        env: Dictionary of key=value pairs to save
-    """
-    lines = ["# Auto-generated by run-recipe.py --discover", ""]
-    for key, value in sorted(env.items()):
-        # Quote values with spaces
-        if " " in value or "," in value:
-            lines.append(f'{key}="{value}"')
-        else:
-            lines.append(f"{key}={value}")
-    lines.append("")
-
-    with open(ENV_FILE, "w") as f:
-        f.write("\n".join(lines))
-
-    print(f"Saved to {ENV_FILE}")
-
-
 def run_autodiscover() -> dict[str, str] | None:
     """
-    Run autodiscover.sh and return discovered configuration.
+    Run autodiscover.sh interactively and return discovered configuration.
 
     Executes the autodiscover.sh script to detect cluster topology,
-    then presents an interactive node selection menu.
-
-    EXTENSIBILITY:
-    - To add new discovery methods: Extend autodiscover.sh or add Python detection here
-    - To add GPU detection: Add nvidia-smi parsing to discovered env
-    - To skip interactive selection: Add a --non-interactive flag
-    - To add node health checks: Ping/SSH test each discovered node
-
-    DISCOVERED VARIABLES:
-        CLUSTER_NODES: Comma-separated list of node IPs (user-selected)
-        LOCAL_IP: This machine's IP address
-        ETH_IF: Ethernet interface name (e.g., 'eth0')
-        IB_IF: InfiniBand interface name (e.g., 'ibp12s0') if available
+    including interactive per-node confirmation and .env saving.
+    After autodiscover.sh completes, reads configuration from .env file.
 
     Returns:
-        Dictionary with discovered configuration, or None if discovery failed
+        Dictionary with discovered configuration from .env, or None if discovery failed
     """
     if not AUTODISCOVER_SCRIPT.exists():
         print(f"Error: Autodiscover script not found: {AUTODISCOVER_SCRIPT}")
@@ -632,85 +658,31 @@ def run_autodiscover() -> dict[str, str] | None:
     print("Running autodiscover...")
     print()
 
-    # Run autodiscover in a subshell and capture the variables
-    # We source the script and print the variables we care about
+    # Pass CONFIG_FILE so autodiscover.sh knows where to save the config.
+    # Do NOT set CONFIG_FILE_SET=true — that would cause an error if the file
+    # doesn't exist yet (it's the file we're about to create).
+    env_vars = os.environ.copy()
+    env_vars["CONFIG_FILE"] = str(ENV_FILE)
+    env_vars["FORCE_DISCOVER"] = "true"
+    env_vars.pop("CONFIG_FILE_SET", None)
+
+    # Run autodiscover interactively so its prompts are shown to the user
     script = f"""
         source '{AUTODISCOVER_SCRIPT}'
-        detect_interfaces
-        detect_local_ip
-        detect_nodes
-        echo "CLUSTER_NODES=$NODES_ARG"
-        echo "LOCAL_IP=$LOCAL_IP"
-        echo "ETH_IF=$ETH_IF"
-        echo "IB_IF=$IB_IF"
+        run_autodiscover
     """
 
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    result = subprocess.run(["bash", "-c", script], env=env_vars)
 
     if result.returncode != 0:
-        print("Autodiscover output:")
-        print(result.stdout)
-        if result.stderr:
-            print(result.stderr)
         print("Error: Autodiscover failed")
         return None
 
-    # Print the autodiscover output (excluding the final variable lines)
-    output_lines = result.stdout.strip().split("\n")
-    env = {}
-    for line in output_lines:
-        if "=" in line and any(
-            line.startswith(k)
-            for k in ["CLUSTER_NODES=", "LOCAL_IP=", "ETH_IF=", "IB_IF="]
-        ):
-            key, _, value = line.partition("=")
-            env[key] = value
-        else:
-            print(line)
-
-    print()
-
-    # Interactive node selection
-    if env.get("CLUSTER_NODES"):
-        all_nodes = [n.strip() for n in env["CLUSTER_NODES"].split(",") if n.strip()]
-        local_ip = env.get("LOCAL_IP", "")
-
-        if len(all_nodes) > 1:
-            print("Select which nodes to include in the cluster:")
-            print()
-
-            selected_nodes = []
-            for node in all_nodes:
-                is_local = node == local_ip
-                label = f"{node} (this machine)" if is_local else node
-
-                # Default to yes for all nodes
-                while True:
-                    response = input(f"  Include {label}? [Y/n]: ").strip().lower()
-                    if response in ("", "y", "yes"):
-                        selected_nodes.append(node)
-                        break
-                    elif response in ("n", "no"):
-                        break
-                    else:
-                        print("    Please enter 'y' or 'n'")
-
-            print()
-
-            if not selected_nodes:
-                print("No nodes selected. Aborting.")
-                return None
-
-            if len(selected_nodes) == 1:
-                print(f"Only one node selected: {selected_nodes[0]}")
-                print("This will run in solo mode (single node).")
-            else:
-                print(
-                    f"Selected {len(selected_nodes)} nodes: {', '.join(selected_nodes)}"
-                )
-
-            env["CLUSTER_NODES"] = ",".join(selected_nodes)
-            print()
+    # Read configuration from the .env file that autodiscover.sh wrote
+    env = load_env_file()
+    if not env.get("CLUSTER_NODES"):
+        print("Autodiscover completed but no CLUSTER_NODES found in .env")
+        return None
 
     return env
 
@@ -746,26 +718,38 @@ def main():
         epilog="""
 Examples:
   # Basic usage
-  %(prog)s glm-4.7-nvfp4
-  %(prog)s glm-4.7-nvfp4 --port 9000 --solo
+  %(prog)s glm-4.7-flash-awq --solo
+  %(prog)s glm-4.7-flash-awq --port 9000 --solo
 
   # Full setup (build container + download model + run)
-  %(prog)s glm-4.7-nvfp4 --setup
+  %(prog)s glm-4.7-flash-awq --solo --setup
 
-  # Cluster deployment (manual)
-  %(prog)s glm-4.7-nvfp4 -n 192.168.1.1,192.168.1.2 --setup
-
-  # Cluster deployment (auto-discover)
+  # Cluster deployment (default: auto-discover once, then reuse .env)
   %(prog)s --discover              # Detect nodes and save to .env
-  %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+  %(prog)s minimax-m2-awq --setup  # Uses nodes from .env
+
+  # Manual fallback only when autodiscovery cannot support the topology
+  %(prog)s minimax-m2-awq -n HEAD_IP,WORKER_IP --setup
 
   # Just build/download without running
-  %(prog)s glm-4.7-nvfp4 --build-only
-  %(prog)s glm-4.7-nvfp4 --download-only
+  %(prog)s glm-4.7-flash-awq --solo --build-only
+  %(prog)s glm-4.7-flash-awq --solo --download-only
 
   # Pass extra arguments to vLLM (after --)
-  %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
-  %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
+  %(prog)s glm-4.7-flash-awq --solo -- --load-format safetensors
+  %(prog)s glm-4.7-flash-awq --solo -- --served-model-name my-api
+
+  # Apply additional launch-cluster mods
+  %(prog)s glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
+
+  # Apply an upstream vLLM PR at container launch time
+  %(prog)s glm-4.7-flash-awq --solo --apply-vllm-pr 12345
+
+  # Publish ports in solo mode
+  %(prog)s glm-4.7-flash-awq --solo -p 8000:8000
+
+  # Map host directories into the container
+  %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
 
   # List available recipes
   %(prog)s --list
@@ -849,7 +833,9 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
-        "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
+        "-n",
+        "--nodes",
+        help="Manual fallback/override: comma-separated node IPs (first is head node)",
     )
     launch_group.add_argument(
         "-d", "--daemon", action="store_true", help="Run in daemon mode"
@@ -872,7 +858,146 @@ Examples:
         dest="env_vars",
         default=[],
         metavar="VAR=VALUE",
-        help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.",
+        help="Container environment variable (overrides recipe env). Repeatable; last value wins.",
+    )
+    launch_group.add_argument(
+        "--apply-mod",
+        action=OrderedLaunchLayerAction,
+        dest="apply_mods",
+        default=[],
+        metavar="PATH",
+        help="Mod directory or zip to pass to launch-cluster.sh. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "--apply-vllm-pr",
+        action=OrderedLaunchLayerAction,
+        type=runtime_vllm_pr_reference,
+        dest="apply_vllm_prs",
+        default=[],
+        metavar="PR_OR_URL",
+        help="Apply a vLLM PR number or full GitHub PR URL to the installed runtime package. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-p",
+        "--publish",
+        action="append",
+        dest="port_mappings",
+        default=[],
+        metavar="HOST:CONTAINER",
+        help="Publish a container port in solo mode, e.g. -p 8000:8000. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-v",
+        "--volume",
+        action="append",
+        dest="volume_mappings",
+        default=[],
+        metavar="LOCAL:CONTAINER",
+        help="Map a volume using Docker syntax, e.g. -v /local/path:/container/path. Can be used multiple times.",
+    )
+    backend_group = launch_group.add_mutually_exclusive_group()
+    backend_group.add_argument(
+        "--ray",
+        action="store_true",
+        dest="ray",
+        help="Use Ray for multi-node vLLM and ensure --distributed-executor-backend ray is present",
+    )
+    backend_group.add_argument(
+        "--no-ray",
+        action="store_true",
+        dest="no_ray",
+        help="Default for multi-node vLLM without Ray (accepted for compatibility)",
+    )
+    launch_group.add_argument(
+        "--master-port",
+        "--head-port",
+        type=int,
+        dest="master_port",
+        help="Port for cluster coordination (Ray head port or PyTorch distributed master port, default: 29501)",
+    )
+    launch_group.add_argument(
+        "--name",
+        dest="container_name",
+        help="Override container name (default: vllm_node)",
+    )
+    launch_group.add_argument(
+        "--eth-if",
+        dest="eth_if",
+        help="Ethernet interface (overrides .env and auto-detection)",
+    )
+    launch_group.add_argument(
+        "--ib-if",
+        dest="ib_if",
+        help="InfiniBand interface (overrides .env and auto-detection)",
+    )
+    launch_group.add_argument(
+        "-j",
+        dest="build_jobs",
+        type=int,
+        metavar="N",
+        help="Number of parallel build jobs inside container",
+    )
+    launch_group.add_argument(
+        "--no-cache-dirs",
+        action="store_true",
+        dest="no_cache_dirs",
+        help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang",
+    )
+    launch_group.add_argument(
+        "--keep-entrypoint",
+        action="store_true",
+        dest="keep_entrypoint",
+        help="Keep the Docker image entrypoint instead of clearing it before launch",
+    )
+    launch_group.add_argument(
+        "--earlyoom",
+        action="store_true",
+        dest="earlyoom",
+        help="Run earlyoom as the container foreground process (install it with apt-get if missing)",
+    )
+    launch_group.add_argument(
+        "--earlyoom-args",
+        dest="earlyoom_args",
+        metavar="ARGS",
+        help="Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')",
+    )
+    launch_group.add_argument(
+        "--non-privileged",
+        action="store_true",
+        dest="non_privileged",
+        help="Run in non-privileged mode (removes --privileged and --ipc=host)",
+    )
+    launch_group.add_argument(
+        "--mem-limit-gb",
+        type=int,
+        dest="mem_limit_gb",
+        help="Memory limit in GB (only with --non-privileged)",
+    )
+    launch_group.add_argument(
+        "--mem-swap-limit-gb",
+        type=int,
+        dest="mem_swap_limit_gb",
+        help="Memory+swap limit in GB (only with --non-privileged)",
+    )
+    launch_group.add_argument(
+        "--pids-limit",
+        type=int,
+        dest="pids_limit",
+        help="Process limit (only with --non-privileged, default: 4096)",
+    )
+    launch_group.add_argument(
+        "--shm-size-gb",
+        type=int,
+        dest="shm_size_gb",
+        help="Shared memory size in GB (only with --non-privileged, default: 64)",
+    )
+
+    # Config file option
+    parser.add_argument(
+        "--config",
+        dest="config_file",
+        metavar="FILE",
+        help="Path to .env configuration file (default: .env in script directory)",
     )
 
     # Cluster discovery options
@@ -889,6 +1014,13 @@ Examples:
     # Use parse_known_args to allow extra vLLM arguments after --
     args, extra_args = parser.parse_known_args()
 
+    # Set .env file path (use default if not specified)
+    global ENV_FILE
+    if args.config_file:
+        ENV_FILE = Path(args.config_file).resolve()
+    else:
+        ENV_FILE = SCRIPT_DIR / ".env"
+
     # Filter out the -- separator if present
     if extra_args and extra_args[0] == "--":
         extra_args = extra_args[1:]
@@ -903,8 +1035,6 @@ Examples:
         for key, value in sorted(env.items()):
             print(f"  {key}={value}")
         print()
-
-        save_env_file(env)
 
         if not args.recipe:
             return 0
@@ -941,45 +1071,56 @@ Examples:
         print(f"  {recipe['description']}")
     print()
 
+    cli_mods = args.apply_mods or []
+    cli_vllm_prs = args.apply_vllm_prs or []
+    cli_launch_layers = getattr(args, "launch_layers", []) or []
+
     # Determine container image
     container = args.container_override or recipe["container"]
     model = recipe.get("model")
     build_args = recipe.get("build_args", [])
 
-    # Parse nodes - check command line first, then .env file, then autodiscover
-    nodes = parse_nodes(args.nodes)
-    nodes_from_env = False
+    # Keep Docker's -e syntax (including bare names), with the last CLI value
+    # replacing any recipe default for that variable.
+    container_env = {str(key): f"{key}={value}" for key, value in (recipe.get("env") or {}).items()}
+    for env_var in args.env_vars:
+        container_env[env_var.split("=", 1)[0]] = env_var
 
-    if not nodes and not args.solo:
+    # Parse nodes - check command line first, then .env file, then autodiscover
+    nodes = parse_nodes(args.nodes) if not args.solo else []
+    nodes_from_env = False
+    eth_if = None
+    ib_if = None
+
+    if not args.solo:
         # Try to load from .env file
         env = load_env_file()
-        if env.get("CLUSTER_NODES"):
-            nodes = parse_nodes(env["CLUSTER_NODES"])
-            nodes_from_env = True
-            if nodes:
-                print(f"Using cluster nodes from .env: {', '.join(nodes)}")
-                print()
-        else:
-            # No nodes specified and no .env - run autodiscover
-            print("No cluster nodes configured. Running autodiscover...")
-            print()
-
-            discovered_env = run_autodiscover()
-            if discovered_env and discovered_env.get("CLUSTER_NODES"):
-                nodes = parse_nodes(discovered_env["CLUSTER_NODES"])
+        if not nodes:
+            if env.get("CLUSTER_NODES"):
+                nodes = parse_nodes(env["CLUSTER_NODES"])
                 nodes_from_env = True
-
                 if nodes:
-                    # Ask if user wants to save to .env
+                    print(f"Using cluster nodes from .env: {', '.join(nodes)}")
                     print()
-                    response = (
-                        input("Save this configuration to .env for future use? [Y/n]: ")
-                        .strip()
-                        .lower()
-                    )
-                    if response in ("", "y", "yes"):
-                        save_env_file(discovered_env)
-                    print()
+            else:
+                # No nodes specified and no .env - run autodiscover
+                print("No cluster nodes configured. Running autodiscover...")
+                print()
+
+                discovered_env = run_autodiscover()
+                if discovered_env and discovered_env.get("CLUSTER_NODES"):
+                    env = discovered_env  # use freshly loaded env from autodiscover
+                    nodes = parse_nodes(discovered_env["CLUSTER_NODES"])
+                    nodes_from_env = True
+
+        # Resolve network interfaces: CLI > .env > auto-detect by launch-cluster.sh
+        eth_if = args.eth_if or None
+        ib_if = args.ib_if or None
+        if not eth_if or not ib_if:
+            if not eth_if and env.get("ETH_IF"):
+                eth_if = env["ETH_IF"]
+            if not ib_if and env.get("IB_IF"):
+                ib_if = env["IB_IF"]
 
     worker_nodes = get_worker_nodes(nodes) if nodes else []
     is_cluster = len(nodes) > 1
@@ -989,16 +1130,30 @@ Examples:
     solo_only = recipe.get("solo_only", False)
     is_solo = args.solo or not is_cluster
 
+    use_ray = getattr(args, "ray", False) and not is_solo
+
+    if is_solo:
+        explicit_backend_flag = None
+        if getattr(args, "ray", False):
+            explicit_backend_flag = "--ray"
+        elif getattr(args, "no_ray", False):
+            explicit_backend_flag = "--no-ray"
+        if explicit_backend_flag:
+            print(
+                f"Error: {explicit_backend_flag} is incompatible with --solo or a single-node configuration."
+            )
+            return 1
+
     if cluster_only and is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires cluster mode.")
         print(f"This model is too large to run on a single node.")
         print()
         print("Options:")
-        print(
-            f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2"
-        )
-        print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
+        print(f"  1. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        print(
+            "  2. If autodiscovery cannot support the topology, specify nodes as instructed."
+        )
         return 1
     if solo_only and not is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires solo mode.")
@@ -1009,8 +1164,29 @@ Examples:
         print(f"  2. Remove nodes from .env:  {sys.argv[0]} --show-env")
         return 1
 
-    # Determine copy targets for cluster deployments
-    copy_targets = worker_nodes if is_cluster else None
+    if args.port_mappings and not is_solo:
+        print(
+            "Error: -p/--publish port forwarding is only supported in solo mode."
+        )
+        print("Use --solo or remove port mappings for cluster mode.")
+        return 1
+
+    if (args.earlyoom or args.earlyoom_args) and args.keep_entrypoint:
+        print("Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint.")
+        print("Remove --keep-entrypoint so earlyoom can run as the foreground process.")
+        return 1
+
+    # Determine copy targets for build/model distribution.
+    # Prefer COPY_HOSTS from .env (may differ from CLUSTER_NODES in mesh mode),
+    # fall back to worker_nodes derived from CLUSTER_NODES.
+    if is_cluster:
+        copy_hosts_str = env.get("COPY_HOSTS")
+        if copy_hosts_str:
+            copy_targets = [h.strip() for h in copy_hosts_str.split(",") if h.strip()]
+        else:
+            copy_targets = worker_nodes
+    else:
+        copy_targets = None
 
     if args.dry_run:
         print("=== Dry Run ===")
@@ -1030,7 +1206,48 @@ Examples:
             if worker_nodes:
                 print(f"  Workers: {', '.join(worker_nodes)}")
         print(f"Solo mode: {is_solo}")
+        if is_cluster:
+            print(f"Ray mode: {use_ray}")
+        if eth_if:
+            print(
+                f"Ethernet interface: {eth_if}{' (from .env)' if not args.eth_if else ''}"
+            )
+        if ib_if:
+            print(
+                f"InfiniBand interface: {ib_if}{' (from .env)' if not args.ib_if else ''}"
+            )
+        if args.container_name:
+            print(f"Container name: {args.container_name}")
+        if args.non_privileged:
+            print("Non-privileged mode: Yes")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         print()
+
+    ring_env = {}
+    if is_cluster and env.get("CLUSTER_LINKS"):
+        try:
+            topology = Topology.from_env(env)
+            if not (args.build_only or args.download_only):
+                # Validate the effective launch before setup mutates image/model state.
+                topology_overrides = {key: getattr(args, key) for key in (
+                    "port", "host", "tensor_parallel", "gpu_memory_utilization", "max_model_len"
+                ) if getattr(args, key) is not None}
+                topology_script = generate_launch_script(
+                    recipe, topology_overrides, is_solo=False, extra_args=extra_args, use_ray=use_ray)
+                nccl_env = {key.removeprefix("CONTAINER_"): value for key, value in env.items()
+                            if key.startswith("CONTAINER_")}
+                for key, assignment in container_env.items():
+                    if "=" in assignment:
+                        nccl_env[key] = assignment.split("=", 1)[1]
+                    elif key in os.environ:
+                        nccl_env[key] = os.environ[key]
+                    else:
+                        nccl_env.pop(key, None)
+                ring_env = validate_launch(topology, nodes, topology_script, use_ray, nccl_env)
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
 
     # --- Build Phase ---
     if args.build_only or args.setup or args.force_build:
@@ -1056,18 +1273,24 @@ Examples:
                 print()
             else:
                 print(f"Container '{container}' already exists locally.")
-                # Check worker nodes in cluster mode
-                if copy_targets:
-                    missing_on = []
-                    for worker in copy_targets:
-                        if not check_image_exists(container, worker):
-                            missing_on.append(worker)
-                    if missing_on:
-                        print(f"Container missing on workers: {', '.join(missing_on)}")
-                        print("Building and copying...")
-                        if not build_image(container, missing_on, build_args):
-                            print("Error: Failed to build/copy container")
-                            return 1
+                if copy_targets and env.get("CLUSTER_LINKS"):
+                    # Compare exact image IDs using the saved copy paths.
+                    if not build_image(container, copy_targets, copy_only=True):
+                        print("Error: Failed to synchronize container image")
+                        return 1
+                else:
+                    # Check worker nodes in cluster mode
+                    if copy_targets:
+                        missing_on = []
+                        for worker in copy_targets:
+                            if not check_image_exists(container, worker):
+                                missing_on.append(worker)
+                        if missing_on:
+                            print(f"Container missing on workers: {', '.join(missing_on)}")
+                            print("Building and copying...")
+                            if not build_image(container, missing_on, build_args):
+                                print("Error: Failed to build/copy container")
+                                return 1
                 print()
 
         if args.build_only:
@@ -1078,7 +1301,7 @@ Examples:
     if model and (args.download_only or args.setup or args.force_download):
         if args.dry_run:
             model_exists = check_model_exists(model)
-            if args.force_download or not model_exists:
+            if args.force_download or not model_exists or (copy_targets and env.get("CLUSTER_LINKS")):
                 print(f"Would download model: {model}")
                 if copy_targets:
                     print(f"  Would copy to: {', '.join(copy_targets)}")
@@ -1088,7 +1311,7 @@ Examples:
         else:
             model_exists = check_model_exists(model)
 
-            if args.force_download or not model_exists:
+            if args.force_download or not model_exists or (copy_targets and env.get("CLUSTER_LINKS")):
                 print("=== Downloading Model ===")
                 if not download_model(model, copy_targets):
                     print("Error: Failed to download model")
@@ -1105,6 +1328,12 @@ Examples:
     # --- Run Phase ---
     if args.build_only or args.download_only:
         return 0
+
+    # Require the recipe's model locally before starting a container.
+    if not args.dry_run and model and not check_model_exists(model):
+        print(f"Error: Model '{model}' not found in the local Hugging Face cache.")
+        print("Rerun the same command with --setup to download the model before launching.")
+        return 1
 
     # Check if image exists (if not using --setup)
     if not args.dry_run and not args.setup and not check_image_exists(container):
@@ -1166,8 +1395,17 @@ Examples:
 
     # Generate launch script
     script_content = generate_launch_script(
-        recipe, overrides, is_solo=is_solo, extra_args=extra_args
+        recipe,
+        overrides,
+        is_solo=is_solo,
+        extra_args=extra_args,
+        use_ray=use_ray,
     )
+
+    for key, value in ring_env.items():
+        # Validation already rejected conflicting values. Make required ring
+        # settings explicit even when the CLI used a bare, unset variable.
+        container_env[key] = f"{key}={value}"
 
     if args.dry_run:
         print("=== Generated Launch Script ===")
@@ -1177,23 +1415,66 @@ Examples:
         print("1. The above script is saved to a temporary file")
         print()
         print("2. launch-cluster.sh is called with:")
-        cmd_parts = ["   ./launch-cluster.sh", "-t", container]
+        cmd_parts = ["./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                cmd_parts.extend(["--apply-mod", value])
+            else:
+                cmd_parts.extend(["--apply-vllm-pr", value])
         if args.solo:
             cmd_parts.append("--solo")
         elif not is_cluster:
             cmd_parts.append("--solo")
         if args.daemon:
             cmd_parts.append("-d")
+        if use_ray:
+            cmd_parts.append("--ray")
+        elif getattr(args, "no_ray", False):
+            cmd_parts.append("--no-ray")
         if nodes:
             cmd_parts.extend(["-n", ",".join(nodes)])
         if args.nccl_debug:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
-        for env_var in args.env_vars:
+        for env_var in container_env.values():
             cmd_parts.extend(["-e", env_var])
-        cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
-        print(" ".join(cmd_parts))
+        for port_mapping in args.port_mappings:
+            cmd_parts.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd_parts.extend(["-v", volume_mapping])
+        if args.master_port:
+            cmd_parts.extend(["--master-port", str(args.master_port)])
+        if args.container_name:
+            cmd_parts.extend(["--name", args.container_name])
+        if eth_if:
+            cmd_parts.extend(["--eth-if", eth_if])
+        if ib_if:
+            cmd_parts.extend(["--ib-if", ib_if])
+        if args.build_jobs:
+            cmd_parts.extend(["-j", str(args.build_jobs)])
+        if args.no_cache_dirs:
+            cmd_parts.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd_parts.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd_parts.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd_parts.extend(["--earlyoom-args", args.earlyoom_args])
+        if args.non_privileged:
+            cmd_parts.append("--non-privileged")
+        if args.mem_limit_gb:
+            cmd_parts.extend(["--mem-limit-gb", str(args.mem_limit_gb)])
+        if args.mem_swap_limit_gb:
+            cmd_parts.extend(["--mem-swap-limit-gb", str(args.mem_swap_limit_gb)])
+        if args.pids_limit:
+            cmd_parts.extend(["--pids-limit", str(args.pids_limit)])
+        if args.shm_size_gb:
+            cmd_parts.extend(["--shm-size-gb", str(args.shm_size_gb)])
+        if args.config_file:
+            cmd_parts.extend(["--config", args.config_file])
+        print("   " + shlex.join(cmd_parts)
+              + " \\\n      --launch-script /tmp/tmpXXXXXX.sh")
         print()
         print("3. The launch script runs inside the container")
         return 0
@@ -1215,6 +1496,16 @@ Examples:
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                mod_path = Path(value).expanduser()
+                if not mod_path.is_absolute():
+                    mod_path = Path.cwd() / mod_path
+                if not mod_path.exists():
+                    print(f"Warning: Mod path not found: {mod_path}")
+                cmd.extend(["--apply-mod", str(mod_path)])
+            else:
+                cmd.extend(["--apply-vllm-pr", value])
 
         # Add launch options
         if args.solo:
@@ -1226,6 +1517,11 @@ Examples:
         if args.daemon:
             cmd.append("-d")
 
+        if use_ray:
+            cmd.append("--ray")
+        elif getattr(args, "no_ray", False):
+            cmd.append("--no-ray")
+
         # Pass nodes to launch-cluster.sh (from command line, .env, or autodiscover)
         if nodes:
             cmd.extend(["-n", ",".join(nodes)])
@@ -1233,16 +1529,56 @@ Examples:
         if args.nccl_debug:
             cmd.extend(["--nccl-debug", args.nccl_debug])
 
-        for env_var in args.env_vars:
+        for env_var in container_env.values():
             cmd.extend(["-e", env_var])
+
+        for port_mapping in args.port_mappings:
+            cmd.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd.extend(["-v", volume_mapping])
+
+        if args.master_port:
+            cmd.extend(["--master-port", str(args.master_port)])
+        if args.container_name:
+            cmd.extend(["--name", args.container_name])
+        if eth_if:
+            cmd.extend(["--eth-if", eth_if])
+        if ib_if:
+            cmd.extend(["--ib-if", ib_if])
+        if args.build_jobs:
+            cmd.extend(["-j", str(args.build_jobs)])
+        if args.no_cache_dirs:
+            cmd.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd.extend(["--earlyoom-args", args.earlyoom_args])
+        if args.non_privileged:
+            cmd.append("--non-privileged")
+        if args.mem_limit_gb:
+            cmd.extend(["--mem-limit-gb", str(args.mem_limit_gb)])
+        if args.mem_swap_limit_gb:
+            cmd.extend(["--mem-swap-limit-gb", str(args.mem_swap_limit_gb)])
+        if args.pids_limit:
+            cmd.extend(["--pids-limit", str(args.pids_limit)])
+        if args.shm_size_gb:
+            cmd.extend(["--shm-size-gb", str(args.shm_size_gb)])
+
+        if args.config_file:
+            cmd.extend(["--config", args.config_file])
 
         # Add launch script
         cmd.extend(["--launch-script", temp_script])
 
         print(f"=== Launching ===")
         print(f"Container: {container}")
-        if recipe.get("mods"):
-            print(f"Mods: {', '.join(recipe['mods'])}")
+        all_mods = recipe.get("mods", []) + cli_mods
+        if all_mods:
+            print(f"Mods: {', '.join(all_mods)}")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         if is_cluster:
             print(f"Cluster: {len(nodes)} nodes")
         else:
